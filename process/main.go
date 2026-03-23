@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/qdrant/go-client/qdrant"
 	hdf5 "github.com/scigolib/hdf5"
@@ -120,18 +121,29 @@ func process(config *Config) error {
 
 	ctx := context.Background()
 
-	// Create UnionFind
-	uf := NewUnionFind()
-
-	allIDS := make([]int64, 0)
-	neighborsByID, ioDuplicates, err := collectNeighbors(ctx, ds, totalRows, dim, config, pointsClient, &allIDS)
+	readStart := time.Now()
+	items, err := readItemsFromHDF5(ds, totalRows, dim, config)
 	if err != nil {
 		return err
 	}
+	readElapsed := time.Since(readStart)
+	log.Printf("⏱️ Phase 1/3 (read vectors): items=%d elapsed=%s", len(items), readElapsed.Round(time.Millisecond))
 
-	log.Printf("✅ Neighbor search completed for %d items, total edges=%d", len(allIDS), ioDuplicates)
-	log.Printf("🔗 Starting UnionFind phase")
+	searchStart := time.Now()
+	neighborsByID, ioDuplicates, err := collectNeighborsForItems(ctx, items, config, pointsClient)
+	if err != nil {
+		return err
+	}
+	searchElapsed := time.Since(searchStart)
+	log.Printf("⏱️ Phase 2/3 (nearest neighbors): items=%d edges=%d elapsed=%s", len(items), ioDuplicates, searchElapsed.Round(time.Millisecond))
 
+	// Create UnionFind
+	unionStart := time.Now()
+	uf := NewUnionFind()
+	allIDS := make([]int64, 0, len(items))
+	for _, item := range items {
+		allIDS = append(allIDS, item.Id)
+	}
 	for _, id := range allIDS {
 		uf.MakeSet(id)
 	}
@@ -144,8 +156,10 @@ func process(config *Config) error {
 		}
 	}
 	itemCount := len(allIDS)
+	unionElapsed := time.Since(unionStart)
 
-	log.Printf("✅ UnionFind phase completed: items=%d unions=%d", itemCount, unionCount)
+	log.Printf("⏱️ Phase 3/3 (UnionFind): items=%d unions=%d elapsed=%s", itemCount, unionCount, unionElapsed.Round(time.Millisecond))
+	log.Printf("⏱️ Total elapsed (3 phases): %s", (readElapsed + searchElapsed + unionElapsed).Round(time.Millisecond))
 
 	// Generate results and collect statistics
 	log.Printf("📊 Generating results and collecting statistics...")
@@ -281,14 +295,57 @@ func parseFloat32(s string) (float32, error) {
 	return result, err
 }
 
-func collectNeighbors(
+func readItemsFromHDF5(ds *hdf5.Dataset, totalRows, dim int, config *Config) ([]*SearchItem, error) {
+	items := make([]*SearchItem, 0, min(totalRows, config.ProcSize))
+	batchCount := 0
+
+	for offset := 0; offset < totalRows && len(items) < config.ProcSize; offset += config.HDF5ReadBatch {
+		nRows := config.HDF5ReadBatch
+		if remain := totalRows - offset; remain < nRows {
+			nRows = remain
+		}
+		if remain := config.ProcSize - len(items); remain < nRows {
+			nRows = remain
+		}
+		if nRows <= 0 {
+			break
+		}
+
+		raw, err := ds.ReadSlice([]uint64{uint64(offset), 0}, []uint64{uint64(nRows), uint64(dim)})
+		if err != nil {
+			return nil, fmt.Errorf("read slice offset=%d count=%d: %w", offset, nRows, err)
+		}
+		buf, err := toFloat32Slice(raw, nRows*dim)
+		if err != nil {
+			return nil, fmt.Errorf("convert batch offset=%d count=%d: %w", offset, nRows, err)
+		}
+
+		batch := make([]*SearchItem, 0, nRows)
+		for i := 0; i < nRows; i++ {
+			start := i * dim
+			end := start + dim
+			vector := make([]float32, dim)
+			copy(vector, buf[start:end])
+
+			id := config.StartID + int64(offset+i)
+			batch = append(batch, &SearchItem{
+				Id:     id,
+				Vector: vector,
+			})
+		}
+		items = append(items, batch...)
+		batchCount++
+		log.Printf("📦 Read batch %d with %d items", batchCount, len(batch))
+	}
+
+	return items, nil
+}
+
+func collectNeighborsForItems(
 	ctx context.Context,
-	ds *hdf5.Dataset,
-	totalRows int,
-	dim int,
+	items []*SearchItem,
 	config *Config,
 	pointsClient qdrant.PointsClient,
-	allIDs *[]int64,
 ) (map[int64][]int64, int, error) {
 	type searchChunk struct {
 		Items []*SearchItem
@@ -352,71 +409,26 @@ func collectNeighbors(
 		}
 	}()
 
-	batchCount := 0
-readLoop:
-	for offset := 0; ; offset += config.HDF5ReadBatch {
+	for i := 0; i < len(items); i += config.QdrantBatchSize {
+		end := i + config.QdrantBatchSize
+		if end > len(items) {
+			end = len(items)
+		}
+		chunk := searchChunk{Items: items[i:end]}
+
 		select {
 		case <-ctx.Done():
-			break readLoop
-		default:
-		}
-
-		if len(*allIDs) >= config.ProcSize || offset >= totalRows {
-			break
-		}
-
-		nRows := config.HDF5ReadBatch
-		if remain := totalRows - offset; remain < nRows {
-			nRows = remain
-		}
-		if remain := config.ProcSize - len(*allIDs); remain < nRows {
-			nRows = remain
-		}
-		if nRows <= 0 {
-			break
-		}
-
-		raw, err := ds.ReadSlice([]uint64{uint64(offset), 0}, []uint64{uint64(nRows), uint64(dim)})
-		if err != nil {
-			sendErr(fmt.Errorf("read slice offset=%d count=%d: %w", offset, nRows, err))
-			break
-		}
-		buf, err := toFloat32Slice(raw, nRows*dim)
-		if err != nil {
-			sendErr(fmt.Errorf("convert batch offset=%d count=%d: %w", offset, nRows, err))
-			break
-		}
-
-		batch := make([]*SearchItem, 0, nRows)
-		for i := 0; i < nRows; i++ {
-			start := i * dim
-			end := start + dim
-			vector := make([]float32, dim)
-			copy(vector, buf[start:end])
-
-			id := config.StartID + int64(offset+i)
-			batch = append(batch, &SearchItem{
-				Id:     id,
-				Vector: vector,
-			})
-			*allIDs = append(*allIDs, id)
-		}
-
-		batchCount++
-		log.Printf("📦 Read batch %d with %d items", batchCount, len(batch))
-
-		for i := 0; i < len(batch); i += config.QdrantBatchSize {
-			end := i + config.QdrantBatchSize
-			if end > len(batch) {
-				end = len(batch)
-			}
-			chunk := searchChunk{Items: batch[i:end]}
-
+			close(workCh)
+			workersWG.Wait()
+			close(resultCh)
+			<-collectorDone
 			select {
-			case <-ctx.Done():
-				break readLoop
-			case workCh <- chunk:
+			case err := <-errCh:
+				return nil, 0, err
+			default:
+				return nil, 0, ctx.Err()
 			}
+		case workCh <- chunk:
 		}
 	}
 
@@ -432,6 +444,13 @@ readLoop:
 	}
 
 	return neighborsByID, int(duplicateEdges.Load()), nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func searchChunkNeighbors(
