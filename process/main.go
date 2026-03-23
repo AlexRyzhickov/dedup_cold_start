@@ -6,59 +6,66 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/qdrant/go-client/qdrant"
-	"go.ytsaurus.tech/yt/go/ypath"
-	"go.ytsaurus.tech/yt/go/yt"
-	"go.ytsaurus.tech/yt/go/yt/ythttp"
+	hdf5 "github.com/scigolib/hdf5"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
 type SearchItem struct {
-	Id     int64     `yson:"id"`
-	Vector []float32 `yson:"data"`
+	Id     int64
+	Vector []float32
 }
 
 type ResultItem struct {
-	Id    int64 `yson:"id" json:"id"`
-	RepId int64 `yson:"rep_id" json:"rep_id"`
-}
-
-type Pair struct {
-	ItemID int64
-	RepID  int64
+	Id    int64 `json:"id"`
+	RepId int64 `json:"rep_id"`
 }
 
 type Config struct {
-	InputTable      string
-	OutputTable     string
+	HDF5Path        string
+	DatasetName     string
+	OutputFile      string
 	QdrantHost      string
 	QdrantPort      int
 	CollectionName  string
 	SearchLimit     int
 	SearchThreshold float32
 	QdrantBatchSize int
-	YtReadBatchSize int
+	HDF5ReadBatch   int
 	ProcSize        int
+	StartID         int64
 }
 
 func main() {
 	config := &Config{
-		InputTable:      getEnvOrDefault("INPUT_TABLE", "//home/mlinfra/dups_research/zelda_dataset_16_02-16_03"),
-		OutputTable:     getEnvOrDefault("OUTPUT_TABLE", "//home/mlinfra/dups_research/zelda_dataset_16_02-16_03.out_v2"),
+		HDF5Path:        getEnvOrDefault("HDF5_PATH", "/home/alex/RustroverProjects/vector-db-benchmark_mine/datasets/deep-image-96-angular/deep-image-96-angular.hdf5"),
+		DatasetName:     getEnvOrDefault("HDF5_DATASET", "train"),
+		OutputFile:      getEnvOrDefault("OUTPUT_FILE", "output_clusters.jsonl"),
 		QdrantHost:      getEnvOrDefault("QDRANT_HOST", "qdrant.dedup.clouds.idzn.ru"),
 		QdrantPort:      getEnvIntOrDefault("QDRANT_PORT", 6334),
 		CollectionName:  getEnvOrDefault("COLLECTION_NAME", "VkVideoZeldaVideoFusedVkV2"),
 		SearchLimit:     getEnvIntOrDefault("SEARCH_LIMIT", 64),
 		SearchThreshold: getEnvFloat32OrDefault("SEARCH_THRESHOLD", 0.97),
 		QdrantBatchSize: getEnvIntOrDefault("Q_BATCH_SIZE", 1000),
-		YtReadBatchSize: getEnvIntOrDefault("YT_BATCH_SIZE", 1000),
+		HDF5ReadBatch:   getEnvIntOrDefault("HDF5_BATCH_SIZE", 1000),
 		ProcSize:        getEnvIntOrDefault("PROC_SIZE", 1000000000000),
+		StartID:         getEnvInt64OrDefault("START_ID", 0),
 	}
 
-	if config.InputTable == "" || config.OutputTable == "" {
-		log.Fatal("INPUT_TABLE and OUTPUT_TABLE environment variables must be set")
+	if config.HDF5Path == "" || config.DatasetName == "" {
+		log.Fatal("HDF5_PATH and HDF5_DATASET environment variables must be set")
+	}
+	if config.HDF5ReadBatch <= 0 {
+		log.Fatal("HDF5_BATCH_SIZE must be > 0")
+	}
+	if config.QdrantBatchSize <= 0 {
+		log.Fatal("Q_BATCH_SIZE must be > 0")
+	}
+	if config.ProcSize <= 0 {
+		log.Fatal("PROC_SIZE must be > 0")
 	}
 
 	if err := process(config); err != nil {
@@ -69,14 +76,21 @@ func main() {
 func process(config *Config) error {
 	log.Printf("Starting processing with config: %+v", config)
 
-	// Create YT client
-	yc, err := ythttp.NewClient(&yt.Config{
-		Token: os.Getenv("YT_TOKEN"),
-		Proxy: os.Getenv("YT_PROXY"),
-	})
+	file, err := hdf5.Open(config.HDF5Path)
+	if err != nil {
+		return fmt.Errorf("open hdf5 file: %w", err)
+	}
+	defer file.Close()
+
+	ds, foundPath, err := findDataset(file, config.DatasetName)
 	if err != nil {
 		return err
 	}
+	totalRows, dim, err := inferDatasetShape(ds)
+	if err != nil {
+		return err
+	}
+	log.Printf("Dataset found: path=%s rows=%d dim=%d", foundPath, totalRows, dim)
 
 	conn, err := grpc.NewClient(config.QdrantHost, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -87,16 +101,6 @@ func process(config *Config) error {
 
 	ctx := context.Background()
 
-	// Read input table
-	log.Printf("Reading input table: %s", config.InputTable)
-
-	inputPath := ypath.Path(config.InputTable)
-	reader, err := yc.ReadTable(ctx, inputPath, nil)
-	if err != nil {
-		return err
-	}
-	defer reader.Close()
-
 	// Create UnionFind
 	uf := NewUnionFind()
 
@@ -105,29 +109,46 @@ func process(config *Config) error {
 	duplicatesFound := 0
 	batchCount := 0
 
-	for {
-		// Read batch of 10000 items
-		batch := make([]*SearchItem, 0, config.YtReadBatchSize)
-		for len(batch) < config.YtReadBatchSize && reader.Next() {
-			var item SearchItem
-			if err := reader.Scan(&item); err != nil {
-				log.Printf("Error scanning row: %v", err)
-				continue
-			}
-			batch = append(batch, &item)
+	for offset := 0; offset < totalRows; offset += config.HDF5ReadBatch {
+		if len(allIDS) >= config.ProcSize {
+			break
 		}
 
-		if len(batch) == 0 {
-			break // No more items
+		nRows := config.HDF5ReadBatch
+		if remain := totalRows - offset; remain < nRows {
+			nRows = remain
+		}
+		if allow := config.ProcSize - len(allIDS); allow < nRows {
+			nRows = allow
+		}
+		if nRows <= 0 {
+			break
+		}
+
+		raw, err := ds.ReadSlice([]uint64{uint64(offset), 0}, []uint64{uint64(nRows), uint64(dim)})
+		if err != nil {
+			return fmt.Errorf("read slice offset=%d count=%d: %w", offset, nRows, err)
+		}
+		buf, err := toFloat32Slice(raw, nRows*dim)
+		if err != nil {
+			return fmt.Errorf("convert batch offset=%d count=%d: %w", offset, nRows, err)
+		}
+
+		batch := make([]*SearchItem, 0, nRows)
+		for i := 0; i < nRows; i++ {
+			start := i * dim
+			end := start + dim
+			vector := make([]float32, dim)
+			copy(vector, buf[start:end])
+			batch = append(batch, &SearchItem{
+				Id:     config.StartID + int64(offset+i),
+				Vector: vector,
+			})
 		}
 
 		batchCount++
 		log.Printf("📦 Read batch %d with %d items", batchCount, len(batch))
 
-		// Initialize UnionFind for all items in batch
-		if len(allIDS) > config.ProcSize {
-			break
-		}
 		for _, item := range batch {
 			allIDS = append(allIDS, item.Id)
 			uf.MakeSet(item.Id)
@@ -146,15 +167,9 @@ func process(config *Config) error {
 			// Prepare batch search request
 			searchRequests := make([]*qdrant.SearchPoints, len(chunk))
 			for j, item := range chunk {
-				// Convert int64 vector to float32 for Qdrant
-				vector := make([]float32, len(item.Vector))
-				for k, v := range item.Vector {
-					vector[k] = float32(v)
-				}
-
 				searchRequests[j] = &qdrant.SearchPoints{
 					CollectionName: config.CollectionName,
-					Vector:         vector,
+					Vector:         item.Vector,
 					Limit:          uint64(config.SearchLimit),
 					ScoreThreshold: &config.SearchThreshold,
 					WithPayload:    &qdrant.WithPayloadSelector{SelectorOptions: &qdrant.WithPayloadSelector_Enable{Enable: false}},
@@ -208,10 +223,6 @@ func process(config *Config) error {
 
 		log.Printf("📊 Batch %d completed: processed %d items, total duplicates: %d (%.1f%%)",
 			batchCount, itemCount, duplicatesFound, float64(duplicatesFound)/float64(itemCount)*100)
-	}
-
-	if err := reader.Err(); err != nil {
-		return err
 	}
 
 	log.Printf("✅ Completed processing %d items", itemCount)
@@ -282,70 +293,12 @@ func process(config *Config) error {
 	log.Printf("   Largest duplicate group size: %d", maxGroupSize)
 	log.Printf("   Duplication rate: %.2f%%", float64(totalDuplicates)/float64(itemCount)*100)
 
-	// Create output table if it doesn't exist
-	log.Printf("Creating output table: %s", config.OutputTable)
-	if err := createOutputTable(ctx, yc, config.OutputTable); err != nil {
-		return fmt.Errorf("failed to create output table: %w", err)
+	log.Printf("Writing %d results to output file: %s", len(results), config.OutputFile)
+	if err := writeToJSONL(config.OutputFile, results); err != nil {
+		return fmt.Errorf("failed to write output file: %w", err)
 	}
-
-	// Write results to output table
-	log.Printf("Writing %d results to output table: %s", len(results), config.OutputTable)
-	// outputPath := ypath.Path(config.OutputTable)
-
-	// writer, err := yt.WriteTable(ctx, yc, outputPath, nil)
-	// if err != nil {
-	// 	return err
-	// }
-
-	// for _, result := range results {
-	// 	if err := writer.Write(result); err != nil {
-	// 		return err
-	// 	}
-	// }
-	// writer.Commit()
-
-	clusterFile := "output_clusters.jsonl"
-	writeToJSONL(clusterFile, results)
 
 	log.Printf("Successfully completed processing")
-	return nil
-}
-
-func createOutputTable(ctx context.Context, yc yt.Client, tablePath string) error {
-	// Check if table already exists
-	exists, err := yc.NodeExists(ctx, ypath.Path(tablePath), nil)
-	if err != nil {
-		return fmt.Errorf("failed to check if table exists: %w", err)
-	}
-
-	if exists {
-		log.Printf("Table %s already exists", tablePath)
-		return nil
-	}
-
-	// Create table with schema using Node command with attributes
-	attributes := map[string]interface{}{
-		"dynamic": false,
-		"schema": []map[string]interface{}{
-			{
-				"name": "id",
-				"type": "int64",
-			},
-			{
-				"name": "rep_id",
-				"type": "int64",
-			},
-		},
-	}
-
-	_, err = yc.CreateNode(ctx, ypath.Path(tablePath), yt.NodeTable, &yt.CreateNodeOptions{
-		Attributes: attributes,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create table: %w", err)
-	}
-
-	log.Printf("Successfully created table %s", tablePath)
 	return nil
 }
 
@@ -375,8 +328,23 @@ func getEnvFloat32OrDefault(key string, defaultValue float32) float32 {
 	return defaultValue
 }
 
+func getEnvInt64OrDefault(key string, defaultValue int64) int64 {
+	if value := os.Getenv(key); value != "" {
+		if intValue, err := parseInt64(value); err == nil {
+			return intValue
+		}
+	}
+	return defaultValue
+}
+
 func parseInt(s string) (int, error) {
 	var result int
+	_, err := fmt.Sscanf(s, "%d", &result)
+	return result, err
+}
+
+func parseInt64(s string) (int64, error) {
+	var result int64
 	_, err := fmt.Sscanf(s, "%d", &result)
 	return result, err
 }
@@ -385,6 +353,119 @@ func parseFloat32(s string) (float32, error) {
 	var result float32
 	_, err := fmt.Sscanf(s, "%f", &result)
 	return result, err
+}
+
+func findDataset(file *hdf5.File, datasetRef string) (*hdf5.Dataset, string, error) {
+	target := strings.TrimSpace(datasetRef)
+	targetNoSlash := strings.TrimPrefix(target, "/")
+	var (
+		match     *hdf5.Dataset
+		matchPath string
+	)
+
+	file.Walk(func(path string, obj hdf5.Object) {
+		if match != nil {
+			return
+		}
+		ds, ok := obj.(*hdf5.Dataset)
+		if !ok {
+			return
+		}
+		pathNoSlash := strings.TrimPrefix(path, "/")
+		if path == target || pathNoSlash == targetNoSlash || ds.Name() == targetNoSlash || ds.Name() == target {
+			match = ds
+			matchPath = path
+		}
+	})
+
+	if match == nil {
+		return nil, "", fmt.Errorf("dataset %q not found in file", datasetRef)
+	}
+	return match, matchPath, nil
+}
+
+func inferDatasetShape(ds *hdf5.Dataset) (int, int, error) {
+	iter, err := ds.ChunkIterator()
+	if err == nil {
+		dims := iter.DatasetDims()
+		if len(dims) == 2 && dims[0] > 0 && dims[1] > 0 {
+			return int(dims[0]), int(dims[1]), nil
+		}
+	}
+
+	dim, err := inferUpperBoundAxis(ds, 1)
+	if err != nil {
+		return 0, 0, fmt.Errorf("infer dim: %w", err)
+	}
+	rows, err := inferUpperBoundAxis(ds, 0)
+	if err != nil {
+		return 0, 0, fmt.Errorf("infer rows: %w", err)
+	}
+	return rows, dim, nil
+}
+
+func inferUpperBoundAxis(ds *hdf5.Dataset, axis int) (int, error) {
+	canReadIndex := func(idx int) bool {
+		if idx < 0 {
+			return false
+		}
+		start := []uint64{0, 0}
+		count := []uint64{1, 1}
+		if axis == 0 {
+			start[0] = uint64(idx)
+		} else {
+			start[1] = uint64(idx)
+		}
+		_, err := ds.ReadSlice(start, count)
+		return err == nil
+	}
+
+	if !canReadIndex(0) {
+		return 0, fmt.Errorf("axis %d has invalid size", axis)
+	}
+
+	lo, hi := 0, 1
+	for canReadIndex(hi) {
+		lo = hi
+		if hi > (1 << 30) {
+			break
+		}
+		hi *= 2
+	}
+
+	for lo+1 < hi {
+		mid := lo + (hi-lo)/2
+		if canReadIndex(mid) {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+
+	return lo + 1, nil
+}
+
+func toFloat32Slice(v any, expected int) ([]float32, error) {
+	switch arr := v.(type) {
+	case []float64:
+		if len(arr) != expected {
+			return nil, fmt.Errorf("unexpected slice size: got=%d expected=%d", len(arr), expected)
+		}
+		out := make([]float32, len(arr))
+		for i := range arr {
+			out[i] = float32(arr[i])
+		}
+		return out, nil
+	case []float32:
+		if len(arr) != expected {
+			return nil, fmt.Errorf("unexpected slice size: got=%d expected=%d", len(arr), expected)
+		}
+		out := make([]float32, len(arr))
+		copy(out, arr)
+		return out, nil
+	default:
+		return nil, fmt.Errorf("unsupported data type from ReadSlice: %T", v)
+	}
 }
 
 // UnionFind implementation
